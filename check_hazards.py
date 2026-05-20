@@ -1,3 +1,19 @@
+"""
+check_hazard_alerts.py
+
+checks active hazard alerts for a list of grantee addresses against:
+  1. nws active alerts (no key required)
+  2. calfire + nifc + firis fire perimeters (no key required, ca only)
+  3. cal oes evacuation zones (no key required, ca only)
+  4. epa airnow aqi (optional, set AIRNOW_API_KEY in .env)
+  5. nasa firms hotspot detections (optional, set FIRMS_MAP_KEY in .env)
+
+install deps: pip install requests pandas shapely python-dotenv
+
+input: org_addresses.csv (salesforce/gms export)
+output: outputs/grantee_hazard_alerts.csv, outputs/geocode_failures.csv
+"""
+
 import csv
 import io
 import os
@@ -33,7 +49,7 @@ FIRMS_RADIUS_KM      = int(os.getenv("FIRMS_RADIUS_KM", "10"))
 FIRMS_DAYS           = int(os.getenv("FIRMS_DAYS", "1"))
 FIRMS_MIN_CONFIDENCE = os.getenv("FIRMS_MIN_CONFIDENCE", "nominal")
 
-# calfire + nifc + firis combined perimeter layer
+# calfire + nifc + firis combined perimeter layer (what calfire's incident map uses)
 # confirmed fields: incident_name, area_acres, source, displayStatus, FireDiscoveryDate, EditDate
 NIFC_PERIMETERS_URL = (
     "https://services1.arcgis.com/jUJYIo9tSA7EHvfZ/arcgis/rest/services"
@@ -420,6 +436,140 @@ def get_firms_hotspots(lat, lon, map_key):
     return alerts, None
 
 
+
+# map generation
+
+def generate_map(out_df, caloes_zones, nifc_perimeters):
+    import folium
+
+    OUTPUT_MAP = OUTPUT_DIR / "grantee_hazard_map.html"
+
+    # source colors
+    SOURCE_COLORS = {
+        "CalOES": "#D37072",  # red
+        "NIFC":   "#FF6B00",  # orange
+        "NWS":    "#4A90D9",  # blue
+        "AirNow": "#8B5CF6",  # purple
+        "FIRMS":  "#F59E0B",  # amber
+    }
+
+    # severity to marker color
+    SEVERITY_MARKER = {
+        "Extreme": "red",
+        "Severe":  "orange",
+        "Moderate":"blue",
+        "Minor":   "gray",
+    }
+
+    # center on alerted grantees, fall back to CA
+    all_located = out_df.dropna(subset=["lat", "lon"])
+    if not all_located.empty:
+        min_lat, max_lat = all_located["lat"].min(), all_located["lat"].max()
+        min_lon, max_lon = all_located["lon"].min(), all_located["lon"].max()
+        center = [(min_lat + max_lat) / 2, (min_lon + max_lon) / 2]
+    else:
+        center = [36.7783, -119.4179]
+        min_lat, max_lat, min_lon, max_lon = 32.5, 42.0, -124.5, -114.1
+
+    m = folium.Map(location=center, zoom_start=10, tiles="CartoDB positron")
+    m.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]], padding=[30, 30])
+
+    # layer group for cal oes evacuation polygons
+    if caloes_zones:
+        evac_layer = folium.FeatureGroup(name="Cal OES Evacuation Zones", show=True)
+        for polygon, props in caloes_zones:
+            status = props.get("STATUS", "").upper()
+            fill   = "#D37072" if status == "EVACUATION ORDER" else "#E5C447"
+            label  = props.get("ZONE_NAME") or props.get("ZONE_ID", "")
+            county = props.get("COUNTY", "")
+            notes  = props.get("NOTES", "")
+            try:
+                geojson = polygon.__geo_interface__
+                folium.GeoJson(
+                    geojson,
+                    style_function=lambda f, fill=fill: {
+                        "fillColor": fill, "color": fill,
+                        "weight": 1.5, "fillOpacity": 0.35,
+                    },
+                    tooltip=f"{status.title()}<br>{label}<br>{county}{(' — ' + notes) if notes else ''}",
+                ).add_to(evac_layer)
+            except Exception:
+                pass
+        evac_layer.add_to(m)
+
+    # layer group for fire perimeters
+    if nifc_perimeters:
+        fire_layer = folium.FeatureGroup(name="Active Fire Perimeters", show=True)
+        for polygon, props in nifc_perimeters:
+            name  = props.get("incident_name") or props.get("mission", "Unknown")
+            acres = props.get("area_acres", "?")
+            src   = props.get("source", "")
+            try:
+                geojson = polygon.__geo_interface__
+                folium.GeoJson(
+                    geojson,
+                    style_function=lambda f: {
+                        "fillColor": "#FF6B00", "color": "#CC4400",
+                        "weight": 1.5, "fillOpacity": 0.3,
+                    },
+                    tooltip=f"Fire: {name}<br>{round(float(acres)) if acres != '?' else '?'} acres ({src})",
+                ).add_to(fire_layer)
+            except Exception:
+                pass
+        fire_layer.add_to(m)
+
+    # grantee markers — one per unique address, colored by worst alert
+    grantee_layer = folium.FeatureGroup(name="Grantees", show=True)
+    seen_coords = set()
+    for _, row in out_df.iterrows():
+        try:
+            lat, lon = float(row["lat"]), float(row["lon"])
+        except (ValueError, TypeError):
+            continue
+        coord_key = (round(lat, 4), round(lon, 4))
+        if coord_key in seen_coords:
+            continue
+        seen_coords.add(coord_key)
+
+        org = row[COL_ORG_NAME]
+        status = row.get("check_status", "clean")
+        severity = row.get("alert_severity", "")
+        marker_color = SEVERITY_MARKER.get(severity, "green") if "alert" in status else "green"
+
+        # collect all alerts for this address for the popup
+        org_alerts = out_df[
+            (out_df["lat"].astype(str) == str(row["lat"])) &
+            (out_df["alert_event"] != "")
+        ][["source", "alert_event", "alert_headline"]].drop_duplicates()
+
+        if org_alerts.empty:
+            popup_html = f"<b>{org}</b><br>No active alerts"
+        else:
+            rows_html = "".join(
+                f"<tr><td style='padding:2px 6px'><span style='color:{SOURCE_COLORS.get(r.source,'#333')}'>"
+                f"&#9679;</span> {r.source}</td>"
+                f"<td style='padding:2px 6px'>{r.alert_headline}</td></tr>"
+                for r in org_alerts.itertuples()
+            )
+            popup_html = (
+                f"<b>{org}</b><br>"
+                f"<table style='font-size:12px;margin-top:4px'>{rows_html}</table>"
+            )
+
+        folium.Marker(
+            location=[lat, lon],
+            popup=folium.Popup(popup_html, max_width=350),
+            tooltip=org,
+            icon=folium.Icon(color=marker_color, icon="building", prefix="fa"),
+        ).add_to(grantee_layer)
+
+    grantee_layer.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    m.save(str(OUTPUT_MAP))
+    print(f"  map saved to {OUTPUT_MAP}")
+    return OUTPUT_MAP
+
 # main
 
 def main():
@@ -593,6 +743,9 @@ def main():
         for org in error_df[COL_ORG_NAME].unique():
             r2 = error_df[error_df[COL_ORG_NAME] == org].iloc[0]
             print(f"  {org}: {r2['check_status']}")
+
+    print("\ngenerating map...")
+    generate_map(out_df, caloes_zones, nifc_perimeters)
 
 
 if __name__ == "__main__":
