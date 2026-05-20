@@ -21,6 +21,7 @@ import time
 import requests
 import pandas as pd
 from dotenv import load_dotenv
+from datetime import datetime
 from pathlib import Path
 from shapely.geometry import Point, shape
 
@@ -29,8 +30,10 @@ load_dotenv()
 # config
 INPUT_FILE   = "org_addresses.csv"
 OUTPUT_DIR   = Path("outputs")
-OUTPUT_ALERTS   = OUTPUT_DIR / "grantee_hazard_alerts.csv"
-OUTPUT_FAILURES = OUTPUT_DIR / "geocode_failures.csv"
+GEOCODE_CACHE   = OUTPUT_DIR / "geocode_cache.json"  # static, persists across runs
+
+def _stamped(name):
+    return OUTPUT_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}"
 
 # api keys — set in .env, leave blank to skip that source
 AIRNOW_API_KEY = os.getenv("AIRNOW_API_KEY", "")
@@ -81,6 +84,7 @@ COL_CITY     = "Organization: Primary Address City"
 COL_STATE    = "Organization: Primary Address State/Province"
 COL_ZIP      = "Organization: Primary Address Zip/Postal Code"
 COL_COUNTRY  = "Organization: Primary Address Country"
+COL_EIN      = "Organization: EIN"
 
 
 # retry wrappers
@@ -153,10 +157,45 @@ def build_address_key(row):
     return f"{row['_street_clean']}|{row[COL_CITY]}|{row[COL_STATE]}|{row[COL_ZIP]}"
 
 
+# geocode cache
+
+def load_geocode_cache():
+    if GEOCODE_CACHE.exists():
+        import json
+        with open(GEOCODE_CACHE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_geocode_cache(cache):
+    import json
+    with open(GEOCODE_CACHE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def make_cache_key(ein, addr_key):
+    # keyed on EIN + full address string so address changes trigger re-geocode
+    return f"{ein}|{addr_key}"
+
+
 # geocoding
 
 def geocode_batch(unique_addresses):
-    # census batch geocoder response: 8 fields, lon/lat packed as "lon,lat" in field [5]
+    # uses the geographies endpoint to get lat/lon + county/state FIPS in one call.
+    #
+    # response fields (geographies endpoint, csv input, no header):
+    #   [0]  id
+    #   [1]  input address (echoed)
+    #   [2]  match indicator  (Match / No_Match / Tie)
+    #   [3]  match type       (Exact / Non_Exact)
+    #   [4]  output address
+    #   [5]  "lon,lat"        (split on comma)
+    #   [6]  tiger line id
+    #   [7]  side
+    #   [8]  state fips       (2-digit)
+    #   [9]  county fips      (3-digit, combine with [8] for full 5-digit fips)
+    #   [10] census tract
+    #   [11] census block
     print(f"geocoding {len(unique_addresses)} unique addresses...")
     results = {}
     chunk_size = 1000
@@ -174,9 +213,9 @@ def geocode_batch(unique_addresses):
             )
         payload = "\n".join(csv_lines)
         response, err = post_with_retry(
-            "https://geocoding.geo.census.gov/geocoder/locations/addressbatch",
+            "https://geocoding.geo.census.gov/geocoder/geographies/addressbatch",
             files={"addressFile": ("addresses.csv", payload, "text/csv")},
-            data={"benchmark": "Public_AR_Current"},
+            data={"benchmark": "Public_AR_Current", "vintage": "Current_Current"},
             timeout=120,
             label="census geocoder",
         )
@@ -194,25 +233,42 @@ def geocode_batch(unique_addresses):
                 continue
             match_status = parts[2].strip()
             lon, lat = None, None
-            if match_status == "Match" and len(parts) > 5:
-                lonlat = parts[5].strip().split(",")
-                if len(lonlat) == 2:
-                    try:
-                        lon = float(lonlat[0])
-                        lat = float(lonlat[1])
-                    except ValueError:
-                        pass
+            state_fips = county_fips = county_fips_full = tract = ""
+            if match_status == "Match":
+                if len(parts) > 5:
+                    lonlat = parts[5].strip().split(",")
+                    if len(lonlat) == 2:
+                        try:
+                            lon = float(lonlat[0])
+                            lat = float(lonlat[1])
+                        except ValueError:
+                            pass
+                state_fips  = parts[8].strip()  if len(parts) > 8  else ""
+                county_fips = parts[9].strip()  if len(parts) > 9  else ""
+                tract       = parts[10].strip() if len(parts) > 10 else ""
+                county_fips_full = state_fips + county_fips if state_fips and county_fips else ""
+
             addr_key = id_to_key.get(gid)
             if addr_key is None:
                 continue
-            results[addr_key] = {"geocode_match": match_status, "lat": lat, "lon": lon}
+            results[addr_key] = {
+                "geocode_match":    match_status,
+                "lat":              lat,
+                "lon":              lon,
+                "state_fips":       state_fips,
+                "county_fips":      county_fips_full,
+                "census_tract":     tract,
+            }
 
         print(f"  batch {start}–{start + len(chunk)} done")
 
     geo_df = unique_addresses.copy()
-    geo_df["geocode_match"] = geo_df["_addr_key"].map(lambda k: results.get(k, {}).get("geocode_match", "No_Match"))
-    geo_df["lat"] = geo_df["_addr_key"].map(lambda k: results.get(k, {}).get("lat"))
-    geo_df["lon"] = geo_df["_addr_key"].map(lambda k: results.get(k, {}).get("lon"))
+    for col, default in [
+        ("geocode_match", "No_Match"), ("lat", None), ("lon", None),
+        ("state_fips", ""), ("county_fips", ""), ("census_tract", ""),
+    ]:
+        geo_df[col] = geo_df["_addr_key"].map(lambda k, c=col, d=default: results.get(k, {}).get(c, d))
+
     matched = geo_df["geocode_match"].eq("Match").sum()
     print(f"  {matched}/{len(geo_df)} addresses geocoded successfully\n")
     return geo_df
@@ -442,7 +498,7 @@ def get_firms_hotspots(lat, lon, map_key):
 def generate_map(out_df, caloes_zones, nifc_perimeters):
     import folium
 
-    OUTPUT_MAP = OUTPUT_DIR / "grantee_hazard_map.html"
+    OUTPUT_MAP = _stamped("grantee_hazard_map.html")
 
     # source colors
     SOURCE_COLORS = {
@@ -526,6 +582,8 @@ def generate_map(out_df, caloes_zones, nifc_perimeters):
             lat, lon = float(row["lat"]), float(row["lon"])
         except (ValueError, TypeError):
             continue
+        if lat != lat or lon != lon:  # NaN check
+            continue
         coord_key = (round(lat, 4), round(lon, 4))
         if coord_key in seen_coords:
             continue
@@ -574,6 +632,9 @@ def generate_map(out_df, caloes_zones, nifc_perimeters):
 
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_ALERTS   = _stamped("grantee_hazard_alerts.csv")
+    OUTPUT_FAILURES = _stamped("geocode_failures.csv")
+
 
     print("active sources:")
     print("  [x] nws alerts")
@@ -590,14 +651,52 @@ def main():
     grants["_street_clean"] = grants[COL_STREET].apply(normalize_street)
     grants["_addr_key"] = grants.apply(build_address_key, axis=1)
 
+    ein_col = COL_EIN if COL_EIN in grants.columns else None
+    unique_cols = [COL_ORG_NAME, "_street_clean", COL_CITY, COL_STATE, COL_ZIP, "_addr_key"]
+    if ein_col:
+        unique_cols.insert(1, ein_col)
     unique_addrs = (
-        grants[[COL_ORG_NAME, "_street_clean", COL_CITY, COL_STATE, COL_ZIP, "_addr_key"]]
+        grants[unique_cols]
         .drop_duplicates(subset=["_addr_key"])
         .reset_index(drop=True)
     )
     print(f"  {len(unique_addrs)} unique addresses after deduplication\n")
 
-    geocoded = geocode_batch(unique_addrs)
+    cache = load_geocode_cache()
+    cache_hits, to_geocode_idx = [], []
+
+    for idx, row in unique_addrs.iterrows():
+        ein = row.get(ein_col, "") if ein_col else ""
+        ckey = make_cache_key(ein, row["_addr_key"])
+        if ckey in cache:
+            cache_hits.append({**row.to_dict(), **cache[ckey], "geocode_match": "Match (cached)"})
+        else:
+            to_geocode_idx.append(idx)
+
+    to_geocode = unique_addrs.loc[to_geocode_idx].reset_index(drop=True)
+    print(f"  {len(cache_hits)} address(es) resolved from cache")
+    print(f"  {len(to_geocode)} address(es) to geocode\n")
+
+    fresh = geocode_batch(to_geocode) if not to_geocode.empty else pd.DataFrame()
+
+    # update cache with newly geocoded matches
+    if not fresh.empty:
+        for _, row in fresh[fresh["geocode_match"] == "Match"].iterrows():
+            ein = row.get(ein_col, "") if ein_col else ""
+            ckey = make_cache_key(ein, row["_addr_key"])
+            cache[ckey] = {
+                "lat": row["lat"], "lon": row["lon"],
+                "state_fips": row["state_fips"],
+                "county_fips": row["county_fips"],
+                "census_tract": row["census_tract"],
+            }
+        save_geocode_cache(cache)
+        print(f"  geocode cache updated ({len(cache)} total entries)")
+
+    # merge cache hits and fresh results
+    cache_df = pd.DataFrame(cache_hits) if cache_hits else pd.DataFrame()
+    geocoded = pd.concat([cache_df, fresh], ignore_index=True) if not fresh.empty else cache_df
+
     matched_addrs = geocoded[geocoded["lat"].notna()].copy()
     failed_addrs  = geocoded[geocoded["lat"].isna()].copy()
 
@@ -679,7 +778,7 @@ def main():
         addr_statuses[row["_addr_key"]] = status
         time.sleep(NWS_RATE_LIMIT)
 
-    geo_lookup = geocoded.set_index("_addr_key")[["lat", "lon", "geocode_match"]].to_dict("index")
+    geo_lookup = geocoded.set_index("_addr_key")[["lat", "lon", "geocode_match", "state_fips", "county_fips", "census_tract"]].to_dict("index")
     empty_alert = {
         "source": "", "alert_event": "", "alert_severity": "", "alert_urgency": "",
         "alert_certainty": "", "alert_headline": "", "alert_description": "",
@@ -702,6 +801,9 @@ def main():
         base["lat"]           = geo.get("lat")
         base["lon"]           = geo.get("lon")
         base["geocode_match"] = geo.get("geocode_match", "not_attempted")
+        base["state_fips"]    = geo.get("state_fips", "")
+        base["county_fips"]   = geo.get("county_fips", "")
+        base["census_tract"]  = geo.get("census_tract", "")
         base["check_status"]  = status
 
         if alerts:
@@ -711,13 +813,39 @@ def main():
             output_rows.append({**base, **empty_alert})
 
     out_df = pd.DataFrame(output_rows)
-    out_df.to_csv(OUTPUT_ALERTS, index=False)
 
-    total   = out_df["Request: Reference Number"].nunique()
-    alerted = out_df[out_df["check_status"].str.contains("alert", na=False)]["Request: Reference Number"].nunique()
-    errored = out_df[out_df["check_status"].str.contains("error|skipped", na=False)]["Request: Reference Number"].nunique()
-    clean   = out_df[out_df["check_status"] == "clean"]["Request: Reference Number"].nunique()
-    failed  = out_df[out_df["check_status"] == "geocode_failed"]["Request: Reference Number"].nunique()
+    # add has_alert flag (true if any alert field is populated)
+    alert_cols = ["source", "alert_event", "alert_severity", "alert_urgency",
+                  "alert_certainty", "alert_headline", "alert_description",
+                  "evac_zone", "evac_status", "fire_name", "aqi_value", "firms_frp"]
+    out_df["has_alert"] = out_df[[c for c in alert_cols if c in out_df.columns]].apply(
+        lambda row: any(str(v).strip() not in ("", "nan") for v in row), axis=1
+    )
+
+    # dedupe to one row per org+alert combo, collapsing grant reference numbers
+    # into a comma-separated list in a single column
+    ref_col = "Request: Reference Number"
+    group_cols = [c for c in out_df.columns if c != ref_col]
+    collapsed = (
+        out_df.groupby(group_cols, dropna=False)[ref_col]
+        .apply(lambda refs: ", ".join(sorted(refs.dropna().unique())))
+        .reset_index()
+        .rename(columns={ref_col: "Grant Reference Numbers"})
+    )
+
+    # put has_alert and grant reference numbers at the far left
+    front_cols = ["has_alert", "Grant Reference Numbers"]
+    other_cols = [c for c in collapsed.columns if c not in front_cols]
+    collapsed  = collapsed[front_cols + other_cols]
+
+    collapsed.to_csv(OUTPUT_ALERTS, index=False)
+    out_df = collapsed  # keep downstream summary code working
+
+    total   = len(out_df)
+    alerted = out_df["has_alert"].sum()
+    errored = out_df[out_df["check_status"].str.contains("error|skipped", na=False)].shape[0]
+    clean   = out_df[out_df["check_status"] == "clean"].shape[0]
+    failed  = out_df[out_df["check_status"] == "geocode_failed"].shape[0]
 
     print(f"\n--- run summary ---")
     print(f"  total grants:      {total}")
@@ -729,7 +857,7 @@ def main():
 
     if alerted > 0:
         print("\n--- alerts by source ---")
-        alert_df = out_df[out_df["alert_event"] != ""]
+        alert_df = out_df[out_df["has_alert"]]
         summary = (
             alert_df.groupby([COL_ORG_NAME, COL_STATE, "source", "alert_event", "alert_severity"])
             .size().reset_index(name="count")
@@ -740,9 +868,8 @@ def main():
     if errored > 0:
         print("\n--- check errors (results may be incomplete) ---")
         error_df = out_df[out_df["check_status"].str.contains("error|skipped", na=False)]
-        for org in error_df[COL_ORG_NAME].unique():
-            r2 = error_df[error_df[COL_ORG_NAME] == org].iloc[0]
-            print(f"  {org}: {r2['check_status']}")
+        for _, r2 in error_df[[COL_ORG_NAME, "check_status"]].drop_duplicates().iterrows():
+            print(f"  {r2[COL_ORG_NAME]}: {r2['check_status']}")
 
     print("\ngenerating map...")
     generate_map(out_df, caloes_zones, nifc_perimeters)
