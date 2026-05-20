@@ -243,9 +243,9 @@ def geocode_batch(unique_addresses):
                             lat = float(lonlat[1])
                         except ValueError:
                             pass
-                state_fips  = parts[8].strip()  if len(parts) > 8  else ""
-                county_fips = parts[9].strip()  if len(parts) > 9  else ""
-                tract       = parts[10].strip() if len(parts) > 10 else ""
+                state_fips  = parts[8].strip().zfill(2)  if len(parts) > 8  else ""
+                county_fips = parts[9].strip().zfill(3)  if len(parts) > 9  else ""
+                tract       = parts[10].strip().zfill(6) if len(parts) > 10 else ""
                 county_fips_full = state_fips + county_fips if state_fips and county_fips else ""
 
             addr_key = id_to_key.get(gid)
@@ -822,19 +822,38 @@ def main():
         lambda row: any(str(v).strip() not in ("", "nan") for v in row), axis=1
     )
 
-    # dedupe to one row per org+alert combo, collapsing grant reference numbers
-    # into a comma-separated list in a single column
-    ref_col = "Request: Reference Number"
-    group_cols = [c for c in out_df.columns if c != ref_col]
+    # collapse to one row per org+alert combo.
+    # grant-specific columns (ref number, project title, request id) are
+    # aggregated as comma-separated values; all other columns are org- or
+    # alert-level and used as the group key.
+    grant_cols = {
+        "Request: Reference Number": "Grant Reference Numbers",
+        "Project Title":             "Project Titles",
+        "Request: ID":               "Request IDs",
+    }
+    # only collapse columns that actually exist in the output
+    grant_cols = {k: v for k, v in grant_cols.items() if k in out_df.columns}
+    group_cols = [c for c in out_df.columns if c not in grant_cols and c != "has_alert"]
+
+    agg = {k: lambda s, k=k: ", ".join(sorted(s.dropna().astype(str).unique()))
+           for k in grant_cols}
     collapsed = (
-        out_df.groupby(group_cols, dropna=False)[ref_col]
-        .apply(lambda refs: ", ".join(sorted(refs.dropna().unique())))
+        out_df.groupby(group_cols, dropna=False)
+        .agg(agg)
         .reset_index()
-        .rename(columns={ref_col: "Grant Reference Numbers"})
+        .rename(columns=grant_cols)
     )
 
-    # put has_alert and grant reference numbers at the far left
-    front_cols = ["has_alert", "Grant Reference Numbers"]
+    # re-derive has_alert after groupby (groupby drops it as a non-numeric non-key)
+    alert_cols = ["source", "alert_event", "alert_severity", "alert_urgency",
+                  "alert_certainty", "alert_headline", "alert_description",
+                  "evac_zone", "evac_status", "fire_name", "aqi_value", "firms_frp"]
+    collapsed["has_alert"] = collapsed[[c for c in alert_cols if c in collapsed.columns]].apply(
+        lambda row: any(str(v).strip() not in ("", "nan") for v in row), axis=1
+    )
+
+    # put has_alert and collapsed grant columns at the far left
+    front_cols = ["has_alert"] + list(grant_cols.values())
     other_cols = [c for c in collapsed.columns if c not in front_cols]
     collapsed  = collapsed[front_cols + other_cols]
 
