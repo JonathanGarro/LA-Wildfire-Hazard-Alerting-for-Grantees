@@ -622,6 +622,21 @@ def generate_map(out_df, caloes_zones, nifc_perimeters):
         ).add_to(grantee_layer)
 
     grantee_layer.add_to(m)
+
+    # county boundaries via census tiger wms tile service
+    # rendered server-side so no geojson download needed
+    folium.WmsTileLayer(
+        url="https://tigerweb.geo.census.gov/arcgis/services/TIGERweb/tigerWMS_Current/MapServer/WMSServer",
+        name="County Boundaries",
+        layers="Counties",
+        fmt="image/png",
+        transparent=True,
+        overlay=True,
+        show=True,
+        attr="U.S. Census Bureau TIGER/Web",
+        opacity=0.6,
+    ).add_to(m)
+
     folium.LayerControl(collapsed=False).add_to(m)
 
     m.save(str(OUTPUT_MAP))
